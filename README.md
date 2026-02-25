@@ -255,6 +255,23 @@ Analytics snapshots are anchored on-chain via Soroban smart contracts, providing
 - ✅ Tamper-proof verification
 - ✅ Immutable audit trails
 - ✅ Trustless data integrity
+- ✅ Automated security scanning via GitHub Actions
+- ✅ Zero known vulnerabilities in dependencies
+
+**Security Updates:** See [frontend/SECURITY_FIXES.md](./frontend/SECURITY_FIXES.md) for details on resolved vulnerabilities.
+
+**Automated Scanning:**
+```bash
+# Run security audit
+cd frontend && npm audit
+
+# Auto-fix vulnerabilities
+npm audit fix
+
+# Use security update script
+./scripts/security-update.sh  # Unix/Linux/macOS
+./scripts/security-update.ps1 # Windows
+```
 
 ---
 
