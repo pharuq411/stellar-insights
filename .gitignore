@@ -1,12 +1,18 @@
-# Rust
+# ============================================
+# CRITICAL: NEVER COMMIT THESE FILES!
+# ============================================
+
+# Rust build artifacts - NEVER commit!
 **/target/
+target/
 **/*.rs.bk
-Cargo.lock
 *.pdb
 
-# Node
+# Node dependencies - NEVER commit!
 **/node_modules/
+node_modules/
 **/.next/
+.next/
 **/dist/
 **/build/
 npm-debug.log*
@@ -14,19 +20,25 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# Environment
-.env
-.env.local
-.env.*.local
-
-# Database
+# Database files - NEVER commit!
 *.db
 *.db-shm
 *.db-wal
 *.sqlite
 *.sqlite3
+dev.db
+stellar_insights.db
 
-# IDE
+# Environment files - NEVER commit!
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+
+# ============================================
+# IDE and Editor files
+# ============================================
 .vscode/
 .idea/
 *.swp
@@ -34,21 +46,34 @@ yarn-error.log*
 *~
 .DS_Store
 
+# ============================================
 # Logs
+# ============================================
 logs/
 *.log
 
+# ============================================
 # Testing
+# ============================================
 coverage/
 .nyc_output/
 
+# ============================================
 # Build artifacts
+# ============================================
 *.wasm
 *.so
 *.dylib
 *.dll
 
+# ============================================
 # Temporary files
+# ============================================
 tmp/
 temp/
 *.tmp
+
+# ============================================
+# Project specific
+# ============================================
+requirements.md

@@ -1,11 +1,6 @@
 //! HTTP handlers for snapshot generation and submission
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -14,7 +9,6 @@ use tracing::{error, info};
 use crate::database::Database;
 use crate::services::contract::ContractService;
 use crate::services::snapshot::SnapshotService;
-use crate::snapshot::schema::AnalyticsSnapshot;
 
 /// Response for snapshot generation
 #[derive(Debug, Serialize)]
@@ -50,10 +44,11 @@ pub struct GenerateSnapshotRequest {
 pub struct SnapshotAppState {
     pub db: Arc<Database>,
     pub contract_service: Option<Arc<ContractService>>,
+    pub snapshot_service: Arc<SnapshotService>,
 }
 
 /// Generate a snapshot (optionally submit to contract)
-/// 
+///
 /// POST /api/snapshots/generate
 pub async fn generate_snapshot(
     State(state): State<SnapshotAppState>,
@@ -64,80 +59,51 @@ pub async fn generate_snapshot(
         request.epoch, request.submit_to_contract
     );
 
-    // Create a snapshot with current timestamp
-    // In a real implementation, this would fetch metrics from the database
-    let snapshot = AnalyticsSnapshot::new(request.epoch, Utc::now());
-    
-    // TODO: Populate snapshot with actual metrics from database
-    // Example:
-    // let anchors = state.db.get_all_anchors().await?;
-    // for anchor in anchors {
-    //     let metrics = compute_anchor_metrics(&anchor).await?;
-    //     snapshot.add_anchor_metrics(metrics);
-    // }
+    // Use the comprehensive snapshot service to handle all requirements
+    match state
+        .snapshot_service
+        .generate_and_submit_snapshot(request.epoch)
+        .await
+    {
+        Ok(result) => {
+            let hash = result.hash.clone();
+            let response = SnapshotResponse {
+                epoch: result.epoch,
+                timestamp: result.timestamp.to_rfc3339(),
+                hash: result.hash,
+                schema_version: 1, // From SCHEMA_VERSION
+                anchor_count: result.anchor_count,
+                corridor_count: result.corridor_count,
+                submission: result.submission_result.map(|sr| SubmissionInfo {
+                    transaction_hash: sr.transaction_hash,
+                    ledger: sr.ledger,
+                    contract_timestamp: sr.timestamp,
+                }),
+            };
 
-    let anchor_count = snapshot.anchor_metrics.len();
-    let corridor_count = snapshot.corridor_metrics.len();
-    let timestamp = snapshot.timestamp.to_rfc3339();
+            info!(
+                "Successfully generated snapshot for epoch {}: hash={}, anchors={}, corridors={}, submitted={}",
+                result.epoch,
+                hash,
+                result.anchor_count,
+                result.corridor_count,
+                result.verification_successful
+            );
 
-    // Determine if we should submit to contract
-    let should_submit = request.submit_to_contract && state.contract_service.is_some();
-
-    let (_hash_bytes, hash_hex, version, submission) = if should_submit {
-        let contract_service = state
-            .contract_service
-            .as_ref()
-            .expect("Contract service should be available");
-
-        // Hash and submit to contract
-        let (hash_bytes, hash_hex, version, submission_result) =
-            SnapshotService::version_hash_and_submit(snapshot, contract_service.as_ref())
-                .await
-                .map_err(|e| {
-                    error!("Failed to submit snapshot: {}", e);
-                    SnapshotError::SubmissionError(e.to_string())
-                })?;
-
-        let submission = Some(SubmissionInfo {
-            transaction_hash: submission_result.transaction_hash,
-            ledger: submission_result.ledger,
-            contract_timestamp: submission_result.timestamp,
-        });
-
-        (hash_bytes, hash_hex, version, submission)
-    } else {
-        // Just hash without submitting
-        let (hash_bytes, hash_hex, version) = SnapshotService::version_and_hash(snapshot)
-            .map_err(|e| {
-                error!("Failed to hash snapshot: {}", e);
-                SnapshotError::HashingError(e.to_string())
-            })?;
-
-        (hash_bytes, hash_hex, version, None)
-    };
-
-    info!(
-        "✓ Snapshot generated for epoch {} (hash: {}, anchors: {}, corridors: {})",
-        request.epoch, hash_hex, anchor_count, corridor_count
-    );
-
-    if submission.is_some() {
-        info!("✓ Snapshot submitted to contract successfully");
+            Ok(Json(response))
+        }
+        Err(e) => {
+            error!(
+                "Failed to generate snapshot for epoch {}: {}",
+                request.epoch, e
+            );
+            Err(SnapshotError::GenerationFailed(e.to_string()))
+        }
     }
-
-    Ok(Json(SnapshotResponse {
-        epoch: request.epoch,
-        timestamp,
-        hash: hash_hex,
-        schema_version: version,
-        anchor_count,
-        corridor_count,
-        submission,
-    }))
 }
 
 /// Health check for contract service
-/// 
+///
 /// GET /api/snapshots/contract/health
 pub async fn contract_health_check(
     State(state): State<SnapshotAppState>,
@@ -167,6 +133,7 @@ pub struct ContractHealthResponse {
 /// Error types for snapshot operations
 #[derive(Debug)]
 pub enum SnapshotError {
+    GenerationFailed(String),
     GenerationError(String),
     HashingError(String),
     SubmissionError(String),
@@ -177,6 +144,7 @@ pub enum SnapshotError {
 impl IntoResponse for SnapshotError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
+            SnapshotError::GenerationFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             SnapshotError::GenerationError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             SnapshotError::HashingError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             SnapshotError::SubmissionError(msg) => (StatusCode::BAD_GATEWAY, msg),

@@ -4,8 +4,9 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::handlers::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult};
 use crate::models::corridor::{Corridor, CorridorMetrics};
 use crate::models::SortBy;
 use crate::state::AppState;
@@ -135,11 +136,17 @@ pub async fn list_corridors(
 
     let metrics = if params.time_period.is_some() {
         // Use aggregated metrics for time periods
-        let aggregated = app_state.db
+        let aggregated = app_state
+            .db
             .corridor_aggregates()
             .get_aggregated_corridor_metrics(start_date, end_date)
             .await
-            .map_err(|e| ApiError::InternalError(format!("Failed to fetch corridors: {}", e)))?;
+            .map_err(|e| {
+                ApiError::internal(
+                    "DATABASE_ERROR",
+                    format!("Failed to fetch corridors: {}", e),
+                )
+            })?;
 
         // Convert to CorridorMetrics-like structure for filtering
         aggregated
@@ -158,6 +165,7 @@ pub async fn list_corridors(
                 success_rate: m.avg_success_rate,
                 volume_usd: m.total_volume_usd,
                 avg_settlement_latency_ms: None,
+                median_settlement_latency_ms: None,
                 liquidity_depth_usd: m.total_volume_usd,
                 created_at: m.latest_date,
                 updated_at: m.latest_date,
@@ -165,10 +173,17 @@ pub async fn list_corridors(
             .collect()
     } else {
         // Use daily metrics for single day
-        app_state.db.corridor_aggregates()
+        app_state
+            .db
+            .corridor_aggregates()
             .get_corridor_metrics_for_date(today)
             .await
-            .map_err(|e| ApiError::InternalError(format!("Failed to fetch corridors: {}", e)))?
+            .map_err(|e| {
+                ApiError::internal(
+                    "DATABASE_ERROR",
+                    format!("Failed to fetch corridors: {}", e),
+                )
+            })?
     };
 
     // Apply filters
@@ -252,8 +267,9 @@ pub async fn get_corridor_detail(
 ) -> ApiResult<Json<CorridorDetailResponse>> {
     let parts: Vec<&str> = corridor_key.split("->").collect();
     if parts.len() != 2 {
-        return Err(ApiError::BadRequest(
-            "Invalid corridor key format".to_string(),
+        return Err(ApiError::bad_request(
+            "INVALID_CORRIDOR_FORMAT",
+            "Invalid corridor key format",
         ));
     }
 
@@ -261,8 +277,9 @@ pub async fn get_corridor_detail(
     let asset_b_parts: Vec<&str> = parts[1].split(':').collect();
 
     if asset_a_parts.len() != 2 || asset_b_parts.len() != 2 {
-        return Err(ApiError::BadRequest(
-            "Invalid corridor key format".to_string(),
+        return Err(ApiError::bad_request(
+            "INVALID_CORRIDOR_FORMAT",
+            "Invalid corridor key format",
         ));
     }
 
@@ -276,17 +293,26 @@ pub async fn get_corridor_detail(
     let end_date = Utc::now().date_naive();
     let start_date = end_date - Duration::days(30);
 
-    let metrics = app_state.db
+    let metrics = app_state
+        .db
         .corridor_aggregates()
         .get_corridor_metrics(&corridor, start_date, end_date)
         .await
-        .map_err(|e| ApiError::InternalError(format!("Failed to fetch corridor detail: {}", e)))?;
+        .map_err(|e| {
+            ApiError::internal(
+                "DATABASE_ERROR",
+                format!("Failed to fetch corridor detail: {}", e),
+            )
+        })?;
 
     if metrics.is_empty() {
-        return Err(ApiError::NotFound(format!(
-            "Corridor {} not found",
-            corridor_key
-        )));
+        let mut details = HashMap::new();
+        details.insert("corridor_id".to_string(), serde_json::json!(corridor_key));
+        return Err(ApiError::not_found_with_details(
+            "CORRIDOR_NOT_FOUND",
+            format!("Corridor {} not found", corridor_key),
+            details,
+        ));
     }
 
     let latest = metrics.first().unwrap();
@@ -365,12 +391,16 @@ pub async fn get_corridor_detail(
         })
         .collect();
 
-    let related_metrics = app_state.db
+    let related_metrics = app_state
+        .db
         .corridor_aggregates()
         .get_top_corridors_by_volume(end_date, 4)
         .await
         .map_err(|e| {
-            ApiError::InternalError(format!("Failed to fetch related corridors: {}", e))
+            ApiError::internal(
+                "DATABASE_ERROR",
+                format!("Failed to fetch related corridors: {}", e),
+            )
         })?;
 
     let related_corridors: Vec<CorridorResponse> = related_metrics
@@ -436,6 +466,7 @@ mod tests {
             success_rate: 95.0,
             volume_usd: 1000000.0,
             avg_settlement_latency_ms: Some(400),
+            median_settlement_latency_ms: Some(300),
             liquidity_depth_usd: 500000.0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

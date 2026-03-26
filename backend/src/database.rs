@@ -1,29 +1,237 @@
+use crate::admin_audit_log::AdminAuditLogger;
 use anyhow::Result;
-use chrono::Utc;
-use sqlx::PgPool;
+use chrono::{DateTime, Utc};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::{ConnectOptions, SqlitePool};
+use std::str::FromStr;
+use std::time::Duration;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::analytics::compute_anchor_metrics;
+use crate::models::api_key::{
+    generate_api_key, hash_api_key, ApiKey, ApiKeyInfo, CreateApiKeyRequest, CreateApiKeyResponse,
+};
 use crate::models::{
     Anchor, AnchorDetailResponse, AnchorMetricsHistory, Asset, CorridorRecord, CreateAnchorRequest,
-    MetricRecord, SnapshotRecord,
+    MetricRecord, MuxedAccountAnalytics, MuxedAccountUsage, SnapshotRecord,
 };
 
+/// Configuration for database connection pool
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub connect_timeout_seconds: u64,
+    pub idle_timeout_seconds: u64,
+    pub max_lifetime_seconds: u64,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            min_connections: 2,
+            connect_timeout_seconds: 30,
+            idle_timeout_seconds: 600,
+            max_lifetime_seconds: 1800,
+        }
+    }
+}
+
+/// SQL query logging configuration
+#[derive(Debug, Clone)]
+pub struct SqlLogConfig {
+    /// Log level for statements (trace, debug, info, warn, error, off)
+    pub level: log::LevelFilter,
+    /// In development: log all queries. In production: log only slow queries.
+    pub log_all_in_dev: bool,
+    /// Slow query threshold (ms); only used when log_all_in_dev is false.
+    pub slow_query_threshold_ms: u64,
+}
+
+impl Default for SqlLogConfig {
+    fn default() -> Self {
+        Self {
+            level: log::LevelFilter::Debug,
+            log_all_in_dev: true,
+            slow_query_threshold_ms: 100,
+        }
+    }
+}
+
+impl SqlLogConfig {
+    /// Load from environment:
+    /// - RUST_ENV or ENVIRONMENT: "development" => log all queries, else log only slow
+    /// - DB_LOG_LEVEL: trace | debug | info | warn | error | off (default: debug in dev, info in prod)
+    /// - DB_SLOW_QUERY_MS: threshold in ms for slow query logging in production (default: 100)
+    pub fn from_env() -> Self {
+        let env_mode = std::env::var("RUST_ENV")
+            .or_else(|_| std::env::var("ENVIRONMENT"))
+            .unwrap_or_else(|_| "development".to_string());
+        let is_dev = env_mode.to_lowercase() == "development" || env_mode.to_lowercase() == "dev";
+
+        let level = parse_db_log_level(is_dev);
+        let slow_query_threshold_ms = std::env::var("DB_SLOW_QUERY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+
+        Self {
+            level,
+            log_all_in_dev: is_dev,
+            slow_query_threshold_ms,
+        }
+    }
+}
+
+fn parse_db_log_level(is_dev: bool) -> log::LevelFilter {
+    let default = if is_dev {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
+    let s = std::env::var("DB_LOG_LEVEL").unwrap_or_else(|_| String::new());
+    match s.to_uppercase().as_str() {
+        "TRACE" => log::LevelFilter::Trace,
+        "DEBUG" => log::LevelFilter::Debug,
+        "INFO" => log::LevelFilter::Info,
+        "WARN" | "WARNING" => log::LevelFilter::Warn,
+        "ERROR" => log::LevelFilter::Error,
+        "OFF" | "NONE" => log::LevelFilter::Off,
+        _ => default,
+    }
+}
+
+impl PoolConfig {
+    /// Load pool configuration from environment variables
+    pub fn from_env() -> Self {
+        Self {
+            max_connections: std::env::var("DB_POOL_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+            min_connections: std::env::var("DB_POOL_MIN_CONNECTIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+            connect_timeout_seconds: std::env::var("DB_POOL_CONNECT_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+            idle_timeout_seconds: std::env::var("DB_POOL_IDLE_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
+            max_lifetime_seconds: std::env::var("DB_POOL_MAX_LIFETIME_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1800),
+        }
+    }
+
+    /// Create a configured SQLite pool with these settings.
+    /// Uses WAL journal mode and configurable SQL query logging (all in dev, slow-only in prod).
+    pub async fn create_pool(&self, database_url: &str) -> Result<SqlitePool> {
+        let sql_log = SqlLogConfig::from_env();
+
+        let mut opts: SqliteConnectOptions = database_url
+            .parse()
+            .map_err(|e: sqlx::Error| anyhow::anyhow!("Invalid DATABASE_URL: {}", e))?;
+
+        opts = opts.journal_mode(SqliteJournalMode::Wal);
+
+        if sql_log.level != log::LevelFilter::Off {
+            if sql_log.log_all_in_dev {
+                opts = opts.log_statements(sql_log.level);
+                tracing::info!(
+                    "SQL query logging: all queries at level {:?} (development)",
+                    sql_log.level
+                );
+            } else {
+                let threshold = Duration::from_millis(sql_log.slow_query_threshold_ms);
+                opts = opts.log_slow_statements(sql_log.level, threshold);
+                tracing::info!(
+                    "SQL query logging: slow queries only (> {} ms) at level {:?} (production)",
+                    sql_log.slow_query_threshold_ms,
+                    sql_log.level
+                );
+            }
+        }
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(self.max_connections)
+            .min_connections(self.min_connections)
+            .acquire_timeout(Duration::from_secs(self.connect_timeout_seconds))
+            .idle_timeout(Some(Duration::from_secs(self.idle_timeout_seconds)))
+            .max_lifetime(Some(Duration::from_secs(self.max_lifetime_seconds)))
+            .connect_with(opts)
+            .await?;
+
+        Ok(pool)
+    }
+}
+
+/// Parameters for updating anchor from RPC data
+pub struct AnchorRpcUpdate {
+    pub stellar_account: String,
+    pub total_transactions: i64,
+    pub successful_transactions: i64,
+    pub failed_transactions: i64,
+    pub total_volume_usd: f64,
+    pub avg_settlement_time_ms: i32,
+    pub reliability_score: f64,
+    pub status: String,
+}
+
+/// Parameters for recording anchor metrics history
+pub struct AnchorMetricsParams {
+    pub anchor_id: Uuid,
+    pub success_rate: f64,
+    pub failure_rate: f64,
+    pub reliability_score: f64,
+    pub total_transactions: i64,
+    pub successful_transactions: i64,
+    pub failed_transactions: i64,
+    pub avg_settlement_time_ms: Option<i32>,
+    pub volume_usd: Option<f64>,
+}
+
+/// Connection pool metrics
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PoolMetrics {
+    pub size: u32,
+    pub idle: usize,
+}
+
 pub struct Database {
-    pool: PgPool,
+    pool: SqlitePool,
+    pub admin_audit_logger: AdminAuditLogger,
 }
 
 impl Database {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool) -> Self {
+        let admin_audit_logger = AdminAuditLogger::new(pool.clone());
+        Self {
+            pool,
+            admin_audit_logger,
+        }
     }
 
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
     pub fn corridor_aggregates(&self) -> crate::db::aggregates::CorridorAggregates {
         crate::db::aggregates::CorridorAggregates::new(self.pool.clone())
+    }
+
+    /// Get connection pool metrics
+    pub fn pool_metrics(&self) -> PoolMetrics {
+        PoolMetrics {
+            size: self.pool.size(),
+            idle: self.pool.num_idle(),
+        }
     }
 
     // Anchor operations
@@ -76,6 +284,7 @@ impl Database {
     }
 
     pub async fn list_anchors(&self, limit: i64, offset: i64) -> Result<Vec<Anchor>> {
+        let start = Instant::now();
         let anchors = sqlx::query_as::<_, Anchor>(
             r#"
             SELECT * FROM anchors
@@ -88,6 +297,11 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        crate::observability::metrics::observe_db_query(
+            "list_anchors",
+            "success",
+            start.elapsed().as_secs_f64(),
+        );
         Ok(anchors)
     }
 
@@ -137,17 +351,17 @@ impl Database {
         .await?;
 
         // Record metrics history
-        self.record_anchor_metrics_history(
+        self.record_anchor_metrics_history(AnchorMetricsParams {
             anchor_id,
-            metrics.success_rate,
-            metrics.failure_rate,
-            metrics.reliability_score,
+            success_rate: metrics.success_rate,
+            failure_rate: metrics.failure_rate,
+            reliability_score: metrics.reliability_score,
             total_transactions,
             successful_transactions,
             failed_transactions,
             avg_settlement_time_ms,
             volume_usd,
-        )
+        })
         .await?;
 
         Ok(anchor)
@@ -195,6 +409,46 @@ impl Database {
         Ok(assets)
     }
 
+    pub async fn get_assets_by_anchors(
+        &self,
+        anchor_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<String, Vec<Asset>>> {
+        if anchor_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let anchor_id_strs: Vec<String> = anchor_ids.iter().map(|id| id.to_string()).collect();
+        let placeholders = anchor_id_strs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let query_str = format!(
+            "SELECT * FROM assets WHERE anchor_id IN ({}) ORDER BY anchor_id, asset_code ASC",
+            placeholders
+        );
+
+        let mut query = sqlx::query_as::<_, Asset>(&query_str);
+        for id in &anchor_id_strs {
+            query = query.bind(id);
+        }
+
+        let assets = query.fetch_all(&self.pool).await?;
+
+        let mut result: std::collections::HashMap<String, Vec<Asset>> =
+            std::collections::HashMap::new();
+        for asset in assets {
+            result
+                .entry(asset.anchor_id.clone())
+                .or_insert_with(Vec::new)
+                .push(asset);
+        }
+
+        Ok(result)
+    }
+
     pub async fn count_assets_by_anchor(&self, anchor_id: Uuid) -> Result<i64> {
         let count: (i64,) = sqlx::query_as(
             r#"
@@ -209,17 +463,7 @@ impl Database {
     }
 
     // Update anchor metrics from RPC ingestion
-    pub async fn update_anchor_from_rpc(
-        &self,
-        stellar_account: &str,
-        total_transactions: i64,
-        successful_transactions: i64,
-        failed_transactions: i64,
-        total_volume_usd: f64,
-        avg_settlement_time_ms: i32,
-        reliability_score: f64,
-        status: &str,
-    ) -> Result<()> {
+    pub async fn update_anchor_from_rpc(&self, params: AnchorRpcUpdate) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE anchors
@@ -234,15 +478,15 @@ impl Database {
             WHERE stellar_account = $9
             "#,
         )
-        .bind(total_transactions)
-        .bind(successful_transactions)
-        .bind(failed_transactions)
-        .bind(total_volume_usd)
-        .bind(avg_settlement_time_ms)
-        .bind(reliability_score)
-        .bind(status)
+        .bind(params.total_transactions)
+        .bind(params.successful_transactions)
+        .bind(params.failed_transactions)
+        .bind(params.total_volume_usd)
+        .bind(params.avg_settlement_time_ms)
+        .bind(params.reliability_score)
+        .bind(&params.status)
         .bind(Utc::now())
-        .bind(stellar_account)
+        .bind(&params.stellar_account)
         .execute(&self.pool)
         .await?;
 
@@ -252,15 +496,7 @@ impl Database {
     // Metrics history operations
     pub async fn record_anchor_metrics_history(
         &self,
-        anchor_id: Uuid,
-        success_rate: f64,
-        failure_rate: f64,
-        reliability_score: f64,
-        total_transactions: i64,
-        successful_transactions: i64,
-        failed_transactions: i64,
-        avg_settlement_time_ms: Option<i32>,
-        volume_usd: Option<f64>,
+        params: AnchorMetricsParams,
     ) -> Result<AnchorMetricsHistory> {
         let id = Uuid::new_v4().to_string();
         let history = sqlx::query_as::<_, AnchorMetricsHistory>(
@@ -275,16 +511,16 @@ impl Database {
             "#,
         )
         .bind(id)
-        .bind(anchor_id.to_string())
+        .bind(params.anchor_id.to_string())
         .bind(Utc::now())
-        .bind(success_rate)
-        .bind(failure_rate)
-        .bind(reliability_score)
-        .bind(total_transactions)
-        .bind(successful_transactions)
-        .bind(failed_transactions)
-        .bind(avg_settlement_time_ms.unwrap_or(0))
-        .bind(volume_usd.unwrap_or(0.0))
+        .bind(params.success_rate)
+        .bind(params.failure_rate)
+        .bind(params.reliability_score)
+        .bind(params.total_transactions)
+        .bind(params.successful_transactions)
+        .bind(params.failed_transactions)
+        .bind(params.avg_settlement_time_ms.unwrap_or(0))
+        .bind(params.volume_usd.unwrap_or(0.0))
         .fetch_one(&self.pool)
         .await?;
 
@@ -368,6 +604,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<crate::models::corridor::Corridor>> {
+        let start = Instant::now();
         let records = sqlx::query_as::<_, CorridorRecord>(
             r#"
             SELECT * FROM corridors ORDER BY reliability_score DESC LIMIT $1 OFFSET $2
@@ -378,7 +615,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(records
+        let corridors = records
             .into_iter()
             .map(|r| {
                 crate::models::corridor::Corridor::new(
@@ -388,7 +625,13 @@ impl Database {
                     r.destination_asset_issuer,
                 )
             })
-            .collect())
+            .collect::<Vec<_>>();
+        crate::observability::metrics::observe_db_query(
+            "list_corridors",
+            "success",
+            start.elapsed().as_secs_f64(),
+        );
+        Ok(corridors)
     }
 
     pub async fn get_corridor_by_id(
@@ -563,6 +806,7 @@ impl Database {
     }
 
     pub async fn save_payments(&self, payments: Vec<crate::models::PaymentRecord>) -> Result<()> {
+        let start = Instant::now();
         for payment in payments {
             sqlx::query(
                 r#"
@@ -586,6 +830,11 @@ impl Database {
             .execute(&self.pool)
             .await?;
         }
+        crate::observability::metrics::observe_db_query(
+            "save_payments",
+            "success",
+            start.elapsed().as_secs_f64(),
+        );
         Ok(())
     }
 
@@ -655,5 +904,368 @@ impl Database {
         self.aggregation_db()
             .increment_job_retry_count(job_id)
             .await
+    }
+
+    /// Muxed account analytics: counts and top addresses from payments table.
+    /// Uses M-address detection (starts with 'M', length 69).
+    pub async fn get_muxed_analytics(&self, top_limit: i64) -> Result<MuxedAccountAnalytics> {
+        use crate::muxed;
+        const MUXED_LEN: i64 = 69;
+
+        let total_muxed_payments = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*) FROM payments
+            WHERE (source_account LIKE 'M%' AND LENGTH(source_account) = ?1)
+               OR (destination_account LIKE 'M%' AND LENGTH(destination_account) = ?1)
+            "#,
+        )
+        .bind(MUXED_LEN)
+        .fetch_one(&self.pool)
+        .await?;
+
+        #[derive(sqlx::FromRow)]
+        struct AddrCount {
+            addr: String,
+            cnt: i64,
+        }
+
+        let source_counts: Vec<AddrCount> = sqlx::query_as(
+            r#"
+            SELECT source_account AS addr, COUNT(*) AS cnt FROM payments
+            WHERE source_account LIKE 'M%' AND LENGTH(source_account) = ?1
+            GROUP BY source_account
+            ORDER BY cnt DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(MUXED_LEN)
+        .bind(top_limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let dest_counts: Vec<AddrCount> = sqlx::query_as(
+            r#"
+            SELECT destination_account AS addr, COUNT(*) AS cnt FROM payments
+            WHERE destination_account LIKE 'M%' AND LENGTH(destination_account) = ?1
+            GROUP BY destination_account
+            ORDER BY cnt DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(MUXED_LEN)
+        .bind(top_limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut by_addr: std::collections::HashMap<String, (i64, i64)> =
+            std::collections::HashMap::new();
+        for row in source_counts {
+            by_addr.entry(row.addr).or_insert((0, 0)).0 = row.cnt;
+        }
+        for row in dest_counts {
+            by_addr.entry(row.addr).or_insert((0, 0)).1 = row.cnt;
+        }
+
+        let mut top_muxed_by_activity: Vec<MuxedAccountUsage> = by_addr
+            .into_iter()
+            .map(|(account_address, (src, dest))| {
+                let total = src + dest;
+                let info = muxed::parse_muxed_address(&account_address);
+                MuxedAccountUsage {
+                    account_address,
+                    base_account: info.as_ref().and_then(|i| i.base_account.clone()),
+                    muxed_id: info.and_then(|i| i.muxed_id),
+                    payment_count_as_source: src,
+                    payment_count_as_destination: dest,
+                    total_payments: total,
+                }
+            })
+            .collect();
+        top_muxed_by_activity.sort_by(|a, b| b.total_payments.cmp(&a.total_payments));
+        top_muxed_by_activity.truncate(top_limit as usize);
+
+        let unique_muxed_addresses = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(DISTINCT addr) FROM (
+                SELECT source_account AS addr FROM payments WHERE source_account LIKE 'M%' AND LENGTH(source_account) = ?1
+                UNION
+                SELECT destination_account AS addr FROM payments WHERE destination_account LIKE 'M%' AND LENGTH(destination_account) = ?1
+            )
+            "#,
+        )
+        .bind(MUXED_LEN)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let base_accounts_with_muxed: Vec<String> = top_muxed_by_activity
+            .iter()
+            .filter_map(|u| u.base_account.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        Ok(MuxedAccountAnalytics {
+            total_muxed_accounts: None,
+            active_accounts: None,
+            top_accounts: None,
+            total_muxed_payments: Some(total_muxed_payments),
+            unique_muxed_addresses: Some(unique_muxed_addresses),
+            top_muxed_by_activity: Some(top_muxed_by_activity),
+            base_accounts_with_muxed: Some(base_accounts_with_muxed),
+        })
+    }
+
+    // =========================
+    // Transaction Builder Methods
+    // =========================
+
+    pub async fn create_pending_transaction(
+        &self,
+        source_account: &str,
+        xdr: &str,
+        required_signatures: i32,
+    ) -> Result<crate::models::PendingTransaction> {
+        let id = Uuid::new_v4().to_string();
+        let status = "pending";
+
+        let tx = sqlx::query_as::<_, crate::models::PendingTransaction>(
+            r#"
+            INSERT INTO pending_transactions (id, source_account, xdr, required_signatures, status)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *
+            "#,
+        )
+        .bind(&id)
+        .bind(source_account)
+        .bind(xdr)
+        .bind(required_signatures)
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(tx)
+    }
+
+    pub async fn get_pending_transaction(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::models::PendingTransactionWithSignatures>> {
+        let tx = sqlx::query_as::<_, crate::models::PendingTransaction>(
+            r#"
+            SELECT * FROM pending_transactions WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(transaction) = tx {
+            let signatures = sqlx::query_as::<_, crate::models::Signature>(
+                r#"
+                SELECT * FROM transaction_signatures WHERE transaction_id = $1
+                "#,
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            Ok(Some(crate::models::PendingTransactionWithSignatures {
+                transaction,
+                collected_signatures: signatures,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn add_transaction_signature(
+        &self,
+        transaction_id: &str,
+        signer: &str,
+        signature: &str,
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO transaction_signatures (id, transaction_id, signer, signature)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(id)
+        .bind(transaction_id)
+        .bind(signer)
+        .bind(signature)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_transaction_status(&self, id: &str, status: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_transactions
+            SET status = $1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $2
+            "#,
+        )
+        .bind(status)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // API Key operations
+
+    pub async fn create_api_key(
+        &self,
+        wallet_address: &str,
+        req: CreateApiKeyRequest,
+    ) -> Result<CreateApiKeyResponse> {
+        let id = Uuid::new_v4().to_string();
+        let (plain_key, prefix, key_hash) = generate_api_key();
+        let scopes = req.scopes.unwrap_or_else(|| "read".to_string());
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO api_keys (id, name, key_prefix, key_hash, wallet_address, scopes, status, created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8)
+            "#,
+        )
+        .bind(&id)
+        .bind(&req.name)
+        .bind(&prefix)
+        .bind(&key_hash)
+        .bind(wallet_address)
+        .bind(&scopes)
+        .bind(&now)
+        .bind(&req.expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        let key = sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(CreateApiKeyResponse {
+            key: ApiKeyInfo::from(key),
+            plain_key,
+        })
+    }
+
+    pub async fn list_api_keys(&self, wallet_address: &str) -> Result<Vec<ApiKeyInfo>> {
+        let keys = sqlx::query_as::<_, ApiKey>(
+            r#"
+            SELECT * FROM api_keys
+            WHERE wallet_address = $1
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(wallet_address)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(keys.into_iter().map(ApiKeyInfo::from).collect())
+    }
+
+    pub async fn get_api_key_by_id(
+        &self,
+        id: &str,
+        wallet_address: &str,
+    ) -> Result<Option<ApiKeyInfo>> {
+        let key = sqlx::query_as::<_, ApiKey>(
+            "SELECT * FROM api_keys WHERE id = $1 AND wallet_address = $2",
+        )
+        .bind(id)
+        .bind(wallet_address)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(key.map(ApiKeyInfo::from))
+    }
+
+    pub async fn validate_api_key(&self, plain_key: &str) -> Result<Option<ApiKey>> {
+        let key_hash = hash_api_key(plain_key);
+
+        let key = sqlx::query_as::<_, ApiKey>(
+            "SELECT * FROM api_keys WHERE key_hash = $1 AND status = 'active'",
+        )
+        .bind(&key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(ref k) = key {
+            if let Some(ref expires_at) = k.expires_at {
+                if let Ok(exp) = DateTime::parse_from_rfc3339(expires_at) {
+                    if exp < Utc::now() {
+                        return Ok(None);
+                    }
+                }
+            }
+
+            sqlx::query("UPDATE api_keys SET last_used_at = $1 WHERE id = $2")
+                .bind(Utc::now().to_rfc3339())
+                .bind(&k.id)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(key)
+    }
+
+    pub async fn revoke_api_key(&self, id: &str, wallet_address: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE api_keys
+            SET status = 'revoked', revoked_at = $1
+            WHERE id = $2 AND wallet_address = $3 AND status = 'active'
+            "#,
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .bind(wallet_address)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn rotate_api_key(
+        &self,
+        id: &str,
+        wallet_address: &str,
+    ) -> Result<Option<CreateApiKeyResponse>> {
+        let old_key = sqlx::query_as::<_, ApiKey>(
+            "SELECT * FROM api_keys WHERE id = $1 AND wallet_address = $2 AND status = 'active'",
+        )
+        .bind(id)
+        .bind(wallet_address)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let old_key = match old_key {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        self.revoke_api_key(id, wallet_address).await?;
+
+        let new_key = self
+            .create_api_key(
+                wallet_address,
+                CreateApiKeyRequest {
+                    name: old_key.name,
+                    scopes: Some(old_key.scopes),
+                    expires_at: old_key.expires_at,
+                },
+            )
+            .await?;
+
+        Ok(Some(new_key))
     }
 }
