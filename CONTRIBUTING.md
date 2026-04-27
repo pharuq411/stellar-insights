@@ -123,10 +123,10 @@ Then create a Pull Request on GitHub with:
 
 ## 🎯 Finding Issues to Work On
 
-Check out our [70 GitHub issues](./GITHUB_ISSUES.md):
-- **Frontend:** 25 issues (UI, charts, features)
-- **Backend:** 25 issues (API, analytics, performance)
-- **Contracts:** 20 issues (Soroban, security, optimization)
+Check out our [GitHub Issues](https://github.com/Ndifreke000/stellar-insights/issues):
+- **Frontend:** UI, charts, features
+- **Backend:** API, analytics, performance
+- **Contracts:** Soroban, security, optimization
 
 Look for labels:
 - `good-first-issue` - Great for newcomers
@@ -328,6 +328,8 @@ Contributors will be:
 ---
 
 ## 📜 Code of Conduct
+
+This project follows our [Code of Conduct](./CODE_OF_CONDUCT.md). By participating, you agree to uphold it.
 
 - Be respectful and inclusive
 - Welcome newcomers
