@@ -42,7 +42,8 @@ npm run dev
 ## 📁 Structure
 
 - `backend/` Rust services
-- `frontend/` dashboard
+- `frontend/` Next.js dashboard
+- `mobile/` React Native mobile app
 - `contracts/` Soroban contracts
 - `docs/` additional docs
 

@@ -64,7 +64,8 @@ export interface ApiUsageOverview {
   }[];
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+import { config } from '@/config';
+const API_BASE = config.apiUrl;
 
 export async function fetchAnalyticsMetrics(): Promise<AnalyticsMetrics> {
   try {
@@ -120,7 +121,7 @@ export async function fetchApiUsageOverview(): Promise<ApiUsageOverview> {
         error.message.includes('Network request failed'));
 
     if (!isNetworkError) {
-      console.error("Failed to fetch API usage overview:", error);
+      logger.error("Failed to fetch API usage overview:", error instanceof Error ? error : new Error(String(error)));
     }
 
     return getMockApiUsageOverview();

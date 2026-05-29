@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { logger } from '@/lib/logger';
 import { Badge } from '@/components/ui/badge';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -56,9 +57,9 @@ export const OnChainVerification = ({ className = '' }: OnChainVerificationProps
         auditTrail: data.auditTrail || []
       });
     } catch (err) {
-      console.error('Error fetching verification data:', err);
+      logger.error('Error fetching verification data:', err instanceof Error ? err : new Error(String(err)));
       setError('Failed to load verification data');
-      setVerificationData((prev: any) => ({ ...prev, status: 'failed' }));
+      setVerificationData((prev) => ({ ...prev, status: 'failed' }));
     }
   };
 
@@ -169,7 +170,7 @@ export const OnChainVerification = ({ className = '' }: OnChainVerificationProps
           <p className="text-sm text-slate-500 dark:text-slate-400 italic">No verification history available</p>
         ) : (
           <div className="space-y-2 max-h-48 overflow-y-auto">
-            {verificationData.auditTrail.map((entry: any) => (
+            {verificationData.auditTrail.map((entry: VerificationSummary) => (
               <div 
                 key={`${entry.epoch}-${entry.transaction_hash}`}
                 className="flex items-center justify-between p-2 bg-slate-50 dark:bg-slate-700/50 rounded-md"
